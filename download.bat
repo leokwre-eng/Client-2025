@@ -9,27 +9,6 @@ set "GREEN=%ESC%[92m"
 set "RED=%ESC%[91m"
 set "RESET=%ESC%[0m"
 
-choice /C YN /M "Do you have Rec Room in your Steam library? "
-if errorlevel 2 goto :bucket
-
-:steam
-set "STEAM_USERNAME="
-set /p STEAM_USERNAME=Enter your Steam username:
-if "%STEAM_USERNAME%"=="" (
-    echo %RED%No username entered - stopping.%RESET%
-    exit /b 1
-)
-
-echo %CYAN%=== Installing DepotDownloader ===%RESET%
-curl -s -f -L -o DepotDownloader.zip https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_3.4.0/DepotDownloader-windows-x64.zip || goto :error
-if not exist "DepotDownloader" mkdir "DepotDownloader"
-tar -xf DepotDownloader.zip -C DepotDownloader || goto :error
-del DepotDownloader.zip
-
-echo %CYAN%=== Downloading depot via DepotDownloader (will prompt for Steam password) ===%RESET%
-DepotDownloader\DepotDownloader.exe -remember-password -app 471710 -depot 471711 -manifest 1151455856673601091 -dir . -username "%STEAM_USERNAME%" || goto :error
-goto :patch
-
 :bucket
 set "CLIENT_MD5=6820e89bff41906ded7f5c066027f1d6"
 if not exist client.zip goto :download

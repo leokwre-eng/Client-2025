@@ -1,4 +1,6 @@
 ; RecFlare installer - GUI equivalent of download.bat.
+; Always downloads the game client from the community mirror (no Steam /
+; DepotDownloader path).
 ; Build with Inno Setup 6.1+ (https://jrsoftware.org/isinfo.php):
 ;   iscc RecFlareSetup.iss
 ; Output: Output\RecFlareSetup.exe
@@ -45,10 +47,8 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 const
   PatchVersion = 'v0.0.8';
-  DepotManifest = '1151455856673601091';
   ClientMD5 = '6820e89bff41906ded7f5c066027f1d6';
   ClientURL = 'https://s3.g.megas4.com/2koayuyiwxv4groxzwdbbxg43cwustavrkvfb/recflare/2025/client.zip';
-  DepotDownloaderURL = 'https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_3.4.0/DepotDownloader-windows-x64.zip';
   PatchURL = 'https://github.com/recflare/patch-2025/releases/download/' + PatchVersion + '/2025Patch-' + PatchVersion + '-x64.zip';
   { Points the client at the RecFlare server; to use your own instance, fork and
     change these, then rebuild the installer (see README "Custom server"). }
@@ -56,15 +56,8 @@ const
   PhotonHost = 'photon.recflare.net';
 
 var
-  SourcePage: TInputOptionWizardPage;
-  SteamPage: TInputQueryWizardPage;
   DownloadPage: TDownloadWizardPage;
   ReuseLocalClientZip: Boolean;
-
-function UsingSteam: Boolean;
-begin
-  Result := SourcePage.Values[0];
-end;
 
 function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
 begin
@@ -75,28 +68,8 @@ end;
 
 procedure InitializeWizard;
 begin
-  SourcePage := CreateInputOptionPage(wpSelectDir,
-    'Game client source', 'Where should the game files come from?',
-    'Setup needs a copy of the Rec Room game client. Pick the option that applies to you, then click Next.',
-    True, False);
-  SourcePage.Add('I have Rec Room in my Steam library - download it from Steam');
-  SourcePage.Add('I do not have it on Steam - download from the community mirror');
-  SourcePage.SelectedValueIndex := 0;
-
-  SteamPage := CreateInputQueryPage(SourcePage.ID,
-    'Steam sign-in', 'How should the Steam download sign in?',
-    'Enter your Steam username, or leave it blank to sign in by scanning a QR code with the Steam mobile app. ' +
-    'A separate Steam window will open during installation to finish signing in; ' +
-    'this installer never sees your password.');
-  SteamPage.Add('Steam username (optional):', False);
-
   DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
     SetupMessage(msgPreparingDesc), @OnDownloadProgress);
-end;
-
-function ShouldSkipPage(PageID: Integer): Boolean;
-begin
-  Result := (PageID = SteamPage.ID) and not UsingSteam;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -105,23 +78,19 @@ begin
   if CurPageID = wpReady then begin
     DownloadPage.Clear;
     ReuseLocalClientZip := False;
-    if UsingSteam then
-      DownloadPage.Add(DepotDownloaderURL, 'DepotDownloader.zip', '')
-    else begin
-      { A client.zip left behind by download.bat (or a previous run) is reused
-        when it matches the expected hash, like the .bat does. }
-      if FileExists(ExpandConstant('{app}\client.zip')) and
-         SameText(GetMD5OfFile(ExpandConstant('{app}\client.zip')), ClientMD5) then
-        ReuseLocalClientZip := True
-      else
-        DownloadPage.Add(ClientURL, 'client.zip', '');
-    end;
+    { A client.zip left behind by download.bat (or a previous run) is reused
+      when it matches the expected hash. }
+    if FileExists(ExpandConstant('{app}\client.zip')) and
+       SameText(GetMD5OfFile(ExpandConstant('{app}\client.zip')), ClientMD5) then
+      ReuseLocalClientZip := True
+    else
+      DownloadPage.Add(ClientURL, 'client.zip', '');
     DownloadPage.Add(PatchURL, '2025Patch.zip', '');
     DownloadPage.Show;
     try
       try
         DownloadPage.Download;
-        if not UsingSteam and not ReuseLocalClientZip and
+        if not ReuseLocalClientZip and
            not SameText(GetMD5OfFile(ExpandConstant('{tmp}\client.zip')), ClientMD5) then begin
           SuppressibleMsgBox('The downloaded game client did not match the expected checksum. ' +
             'Please run Setup again.', mbCriticalError, MB_OK, IDOK);
@@ -154,33 +123,6 @@ begin
   Result := ForceDirectories(DestDir) and
     Exec(ExpandConstant('{sys}\tar.exe'), Format('-xf "%s" -C "%s"', [ZipPath, DestDir]),
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
-end;
-
-function RunDepotDownloader(var ErrorMsg: String): Boolean;
-var
-  Args: String;
-  ResultCode: Integer;
-begin
-  Result := False;
-  if not ExtractZip(ExpandConstant('{tmp}\DepotDownloader.zip'), ExpandConstant('{tmp}\DepotDownloader')) then begin
-    ErrorMsg := 'Could not extract DepotDownloader.';
-    Exit;
-  end;
-  Args := '-app 471710 -depot 471711 -manifest ' + DepotManifest + ' -remember-password' +
-    ' -dir "' + ExpandConstant('{app}') + '"';
-  if Trim(SteamPage.Values[0]) <> '' then
-    Args := Args + ' -username "' + Trim(SteamPage.Values[0]) + '"'
-  else
-    Args := Args + ' -qr';
-  SetPreparingStatus('Downloading the game from Steam - follow the sign-in steps in the window that just opened...');
-  if not Exec(ExpandConstant('{tmp}\DepotDownloader\DepotDownloader.exe'), Args,
-      ExpandConstant('{tmp}\DepotDownloader'), SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode)
-     or (ResultCode <> 0) then begin
-    ErrorMsg := 'The Steam download did not complete (exit code ' + IntToStr(ResultCode) + '). ' +
-      'Check that your sign-in succeeded and that Rec Room is in your Steam library, then run Setup again.';
-    Exit;
-  end;
-  Result := True;
 end;
 
 { Sets Key=Value in the ini shipped by the patch, replacing an existing line
@@ -224,19 +166,14 @@ begin
     Exit;
   end;
 
-  if UsingSteam then begin
-    if not RunDepotDownloader(Result) then
-      Exit;
-  end else begin
-    if ReuseLocalClientZip then
-      ClientZip := ExpandConstant('{app}\client.zip')
-    else
-      ClientZip := ExpandConstant('{tmp}\client.zip');
-    SetPreparingStatus('Extracting the game client (this can take a few minutes)...');
-    if not ExtractZip(ClientZip, ExpandConstant('{app}')) then begin
-      Result := 'Could not extract the game client archive.';
-      Exit;
-    end;
+  if ReuseLocalClientZip then
+    ClientZip := ExpandConstant('{app}\client.zip')
+  else
+    ClientZip := ExpandConstant('{tmp}\client.zip');
+  SetPreparingStatus('Extracting the game client (this can take a few minutes)...');
+  if not ExtractZip(ClientZip, ExpandConstant('{app}')) then begin
+    Result := 'Could not extract the game client archive.';
+    Exit;
   end;
 
   if not SaveStringToFile(ExpandConstant('{app}\steam_appid.txt'), '480', False) then begin

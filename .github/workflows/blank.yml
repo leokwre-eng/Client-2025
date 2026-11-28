@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/download-client.yml'
       - '.github/workflows/blank.yml'
       - 'download.bat'
   workflow_dispatch:
@@ -24,13 +23,20 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      # CRITICAL FIX: without actions/checkout the workspace has no git remote,
+      # so gh cannot infer the repository on its own - this line makes every
+      # gh release ... command work (root cause of the previous 3 failures).
+      GH_REPO: ${{ github.repository }}
       MIRROR_URL: "https://s3.g.megas4.com/2koayuyiwxv4groxzwdbbxg43cwustavrkvfb/recflare/2025/client.zip"
       CLIENT_MD5: "6820e89bff41906ded7f5c066027f1d6"
       EXPECTED_SIZE: "3780378453"
+      TAG: client-2025
+      DIAG: /tmp/diag
     steps:
       - name: Probe mirror reachability
         run: |
-          echo "--- ranged GET probe (this gateway rejects HEAD, so we probe with a 1-byte GET) ---"
+          mkdir -p "$DIAG"
+          exec > >(tee -a "$DIAG/01-probe.log") 2>&1
           for i in 1 2 3; do
             code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 20 -r 0-0 "$MIRROR_URL")
             echo "probe $i: HTTP $code"
@@ -40,6 +46,7 @@ jobs:
 
       - name: Download Rec Room client from mirror (resume + retries)
         run: |
+          exec > >(tee -a "$DIAG/02-download.log") 2>&1
           ok=0
           for i in 1 2 3 4 5; do
             echo "=== download attempt $i ==="
@@ -53,16 +60,15 @@ jobs:
             sleep 30
           done
           if [ "$ok" != "1" ]; then
-            echo "FATAL: download never reached $EXPECTED_SIZE bytes (got $(stat -c%s client.zip 2>/dev/null || echo 0))"
+            echo "FATAL: download never reached $EXPECTED_SIZE bytes"
             exit 1
           fi
           echo "--- verifying MD5 ---"
-          md5sum client.zip
           echo "$CLIENT_MD5  client.zip" | md5sum -c -
 
       - name: Upload single-zip artifact (backup, kept 90 days)
-        uses: actions/upload-artifact@v4
         continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
           name: client-zip-full
           path: client.zip
@@ -72,12 +78,18 @@ jobs:
 
       - name: Split into parts under the 2 GiB release-asset limit
         run: |
+          exec > >(tee -a "$DIAG/03-split.log") 2>&1
+          echo "--- disk before split ---"
+          df -h /
           split -b 1900m -d -a 1 client.zip client.zip.part-
           ls -l client.zip.part-*
           rm -f client.zip
+          echo "--- disk after split ---"
+          df -h /
 
       - name: Write rejoin instructions
         run: |
+          exec > >(tee -a "$DIAG/04-instructions.log") 2>&1
           {
             echo "Rec Room client (2025 mirror snapshot) - split into 2 parts"
             echo ""
@@ -95,28 +107,79 @@ jobs:
             echo "  tar -xf client.zip -C ."
           } > REJOIN-INSTRUCTIONS.txt
 
-      - name: Publish release with client parts (retries, resume-safe)
+      - name: Publish release with client parts
         run: |
-          TAG=client-2025
-          echo "--- diagnostics: token + permissions ---"
-          gh auth status 2>&1 || true
-          gh api "repos/$GITHUB_REPOSITORY" --jq '{permissions: .permissions, default_branch: .default_branch}' || true
-          echo "--- create the release first (empty), with retries ---"
-          created=0
-          for i in 1 2 3 4 5; do
-            if gh release view "$TAG" >/dev/null 2>&1; then echo "release $TAG already exists"; created=1; break; fi
-            if gh release create "$TAG" --title "Rec Room client (2025)" --notes "Full Rec Room client zip (2025 mirror snapshot). MD5 of the rejoined client.zip: 6820e89bff41906ded7f5c066027f1d6. Split into 2 parts because GitHub caps release assets at 2 GiB each - see REJOIN-INSTRUCTIONS.txt for the one-line rejoin command."; then echo "release created"; created=1; break; fi
-            echo "create attempt $i failed; retrying in 30s"; sleep 30
+          exec > >(tee -a "$DIAG/05-publish.log") 2>&1
+          S="$GITHUB_STEP_SUMMARY"
+          echo "### Token + permissions" >> "$S"
+          gh auth status 2>&1 | tee -a "$S" || true
+          curl -sS -o "$DIAG/repo.json" -w 'repo HTTP %{http_code}\n' \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY" || true
+          grep -oE '"(push|admin)": ?(true|false)' "$DIAG/repo.json" | tee -a "$S" || true
+
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AUTH="Authorization: Bearer $GH_TOKEN"
+          ACPT="Accept: application/vnd.github+json"
+
+          created=0; verdict=unknown
+          for i in 1 2 3; do
+            echo "--- create release attempt $i ---"
+            code=$(curl -sS -o "$DIAG/create-body.json" -w '%{http_code}' -X POST \
+              -H "$AUTH" -H "$ACPT" "$API/releases" \
+              -d "{\"tag_name\":\"$TAG\",\"target_commitish\":\"$GITHUB_SHA\",\"name\":\"Rec Room client (2025)\",\"body\":\"Full Rec Room client zip (2025 mirror snapshot). MD5 of the rejoined client.zip: $CLIENT_MD5. Split into 2 parts because GitHub caps release assets at 2 GiB each - see REJOIN-INSTRUCTIONS.txt for the one-line rejoin command.\"}")
+            echo "HTTP $code" | tee -a "$S"
+            head -c 1200 "$DIAG/create-body.json" || true
+            if [ "$code" = "201" ]; then created=1; verdict="created"; break; fi
+            if [ "$code" = "422" ]; then
+              echo "422 -> cleaning leftover tag then retrying" | tee -a "$S"
+              curl -sS -o "$DIAG/tagdel.json" -w 'tag delete HTTP %{http_code}\n' -X DELETE \
+                -H "$AUTH" "$API/git/refs/tags/$TAG" || true
+            fi
+            if [ "$code" = "403" ] || [ "$code" = "401" ]; then
+              verdict="token-403"
+              break
+            fi
+            sleep 30
           done
-          [ "$created" = "1" ] || { echo "FATAL: could not create release $TAG"; exit 1; }
-          echo "--- upload each asset with retries ---"
-          for f in client.zip.part-0 client.zip.part-1 REJOIN-INSTRUCTIONS.txt; do
+
+          if [ "$created" != "1" ]; then
+            {
+              echo ""
+              echo "## FAILED to create release (HTTP verdict: $verdict)"
+              if [ "$verdict" = "token-403" ]; then
+                echo ""
+                echo "**The GITHUB_TOKEN has no write permission on this repository.**"
+                echo ""
+                echo "FIX: open repo **Settings -> Actions -> General -> Workflow permissions**"
+                echo "and select **Read and write permissions**, then re-run this workflow."
+              fi
+              echo ""
+              echo '```json'
+              cat "$DIAG/create-body.json" 2>/dev/null | head -c 2000 || true
+              echo '```'
+            } >> "$S"
+            exit 1
+          fi
+
+          for f in REJOIN-INSTRUCTIONS.txt client.zip.part-0 client.zip.part-1; do
             ok=0
             for i in 1 2 3 4 5; do
               if gh release upload "$TAG" "$f" --clobber; then echo "uploaded: $f"; ok=1; break; fi
-              echo "upload attempt $i for $f failed; retrying in 30s"; sleep 30
+              echo "upload attempt $i for $f failed; retrying in 30s"
+              sleep 30
             done
             [ "$ok" = "1" ] || { echo "FATAL: failed to upload $f"; exit 1; }
           done
-          echo "--- final release state ---"
-          gh release view "$TAG"
+
+          echo "" >> "$S"
+          echo "### Final release state" >> "$S"
+          gh release view "$TAG" --json name,assets --jq '{name: .name, assets: [.assets[] | {name: .name, size: .size}]}' | tee -a "$S"
+
+      - name: Save diagnostics (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-diagnostics
+          path: /tmp/diag/
+          retention-days: 30

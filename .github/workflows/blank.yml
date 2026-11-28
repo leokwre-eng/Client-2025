@@ -26,14 +26,43 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       MIRROR_URL: "https://s3.g.megas4.com/2koayuyiwxv4groxzwdbbxg43cwustavrkvfb/recflare/2025/client.zip"
       CLIENT_MD5: "6820e89bff41906ded7f5c066027f1d6"
+      EXPECTED_SIZE: "3780378453"
     steps:
-      - name: Download Rec Room client from mirror
+      - name: Probe mirror reachability
         run: |
-          curl -fL --retry 3 --retry-delay 5 -o client.zip "$MIRROR_URL"
+          echo "--- ranged GET probe (this gateway rejects HEAD, so we probe with a 1-byte GET) ---"
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 20 -r 0-0 "$MIRROR_URL")
+            echo "probe $i: HTTP $code"
+            if [ "$code" = "206" ] || [ "$code" = "200" ]; then echo "mirror reachable"; break; fi
+            sleep 15
+          done
+
+      - name: Download Rec Room client from mirror (resume + retries)
+        run: |
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "=== download attempt $i ==="
+            curl -fL --connect-timeout 30 --retry 3 --retry-delay 10 --retry-all-errors \
+                 -C - -o client.zip "$MIRROR_URL"
+            rc=$?
+            size=$(stat -c%s client.zip 2>/dev/null || echo 0)
+            echo "curl exit code: $rc | size so far: $size / $EXPECTED_SIZE"
+            if [ "$size" = "$EXPECTED_SIZE" ]; then ok=1; break; fi
+            echo "incomplete - resuming in 30s"
+            sleep 30
+          done
+          if [ "$ok" != "1" ]; then
+            echo "FATAL: download never reached $EXPECTED_SIZE bytes (got $(stat -c%s client.zip 2>/dev/null || echo 0))"
+            exit 1
+          fi
+          echo "--- verifying MD5 ---"
+          md5sum client.zip
           echo "$CLIENT_MD5  client.zip" | md5sum -c -
 
-      - name: Upload single-zip artifact (kept 90 days)
+      - name: Upload single-zip artifact (backup, kept 90 days)
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: client-zip-full
           path: client.zip

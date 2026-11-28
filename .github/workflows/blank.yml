@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/download-client.yml'
+      - '.github/workflows/blank.yml'
+      - 'download.bat'
   workflow_dispatch:
 
 permissions:
@@ -18,7 +20,10 @@ jobs:
   fetch-client:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
     env:
+      GH_TOKEN: ${{ github.token }}
       MIRROR_URL: "https://s3.g.megas4.com/2koayuyiwxv4groxzwdbbxg43cwustavrkvfb/recflare/2025/client.zip"
       CLIENT_MD5: "6820e89bff41906ded7f5c066027f1d6"
     steps:
@@ -61,15 +66,28 @@ jobs:
             echo "  tar -xf client.zip -C ."
           } > REJOIN-INSTRUCTIONS.txt
 
-      - name: Publish release with client parts
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Publish release with client parts (retries, resume-safe)
         run: |
           TAG=client-2025
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" client.zip.part-* REJOIN-INSTRUCTIONS.txt --clobber
-          else
-            gh release create "$TAG" client.zip.part-* REJOIN-INSTRUCTIONS.txt \
-              --title "Rec Room client (2025)" \
-              --notes "Full Rec Room client zip (2025 mirror snapshot). MD5 of the rejoined client.zip: 6820e89bff41906ded7f5c066027f1d6. The zip is split into 2 parts because GitHub caps release assets at 2 GiB each - see REJOIN-INSTRUCTIONS.txt for the one-line rejoin command."
-          fi
+          echo "--- diagnostics: token + permissions ---"
+          gh auth status 2>&1 || true
+          gh api "repos/$GITHUB_REPOSITORY" --jq '{permissions: .permissions, default_branch: .default_branch}' || true
+          echo "--- create the release first (empty), with retries ---"
+          created=0
+          for i in 1 2 3 4 5; do
+            if gh release view "$TAG" >/dev/null 2>&1; then echo "release $TAG already exists"; created=1; break; fi
+            if gh release create "$TAG" --title "Rec Room client (2025)" --notes "Full Rec Room client zip (2025 mirror snapshot). MD5 of the rejoined client.zip: 6820e89bff41906ded7f5c066027f1d6. Split into 2 parts because GitHub caps release assets at 2 GiB each - see REJOIN-INSTRUCTIONS.txt for the one-line rejoin command."; then echo "release created"; created=1; break; fi
+            echo "create attempt $i failed; retrying in 30s"; sleep 30
+          done
+          [ "$created" = "1" ] || { echo "FATAL: could not create release $TAG"; exit 1; }
+          echo "--- upload each asset with retries ---"
+          for f in client.zip.part-0 client.zip.part-1 REJOIN-INSTRUCTIONS.txt; do
+            ok=0
+            for i in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --clobber; then echo "uploaded: $f"; ok=1; break; fi
+              echo "upload attempt $i for $f failed; retrying in 30s"; sleep 30
+            done
+            [ "$ok" = "1" ] || { echo "FATAL: failed to upload $f"; exit 1; }
+          done
+          echo "--- final release state ---"
+          gh release view "$TAG"

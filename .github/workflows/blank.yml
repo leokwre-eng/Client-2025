@@ -1,0 +1,75 @@
+name: Mirror RR client to GitHub
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/download-client.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-client
+  cancel-in-progress: false
+
+jobs:
+  fetch-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MIRROR_URL: "https://s3.g.megas4.com/2koayuyiwxv4groxzwdbbxg43cwustavrkvfb/recflare/2025/client.zip"
+      CLIENT_MD5: "6820e89bff41906ded7f5c066027f1d6"
+    steps:
+      - name: Download Rec Room client from mirror
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o client.zip "$MIRROR_URL"
+          echo "$CLIENT_MD5  client.zip" | md5sum -c -
+
+      - name: Upload single-zip artifact (kept 90 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-zip-full
+          path: client.zip
+          compression-level: 0
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Split into parts under the 2 GiB release-asset limit
+        run: |
+          split -b 1900m -d -a 1 client.zip client.zip.part-
+          ls -l client.zip.part-*
+          rm -f client.zip
+
+      - name: Write rejoin instructions
+        run: |
+          {
+            echo "Rec Room client (2025 mirror snapshot) - split into 2 parts"
+            echo ""
+            echo "client.zip is 3,780,378,453 bytes - too big for a single GitHub"
+            echo "release asset (2 GiB cap). Rejoin on Windows with:"
+            echo ""
+            echo "  copy /b client.zip.part-0+client.zip.part-1 client.zip"
+            echo ""
+            echo "Verify MD5 (optional, expected 6820e89bff41906ded7f5c066027f1d6):"
+            echo ""
+            echo "  certutil -hashfile client.zip MD5"
+            echo ""
+            echo "Then extract with the Windows 10/11 built-in tool:"
+            echo ""
+            echo "  tar -xf client.zip -C ."
+          } > REJOIN-INSTRUCTIONS.txt
+
+      - name: Publish release with client parts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=client-2025
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" client.zip.part-* REJOIN-INSTRUCTIONS.txt --clobber
+          else
+            gh release create "$TAG" client.zip.part-* REJOIN-INSTRUCTIONS.txt \
+              --title "Rec Room client (2025)" \
+              --notes "Full Rec Room client zip (2025 mirror snapshot). MD5 of the rejoined client.zip: 6820e89bff41906ded7f5c066027f1d6. The zip is split into 2 parts because GitHub caps release assets at 2 GiB each - see REJOIN-INSTRUCTIONS.txt for the one-line rejoin command."
+          fi
